@@ -20,12 +20,12 @@ This script mirrors the attached internal flow at the API level:
 
 1. Separate controller and worker roles.
 2. Source uses FFI `init_weight_synchronizer_and_d2h`.
-3. Destination uses pure Python `WeightSynchronizer` on McJax.
+3. Destination uses FFI `init_weight_synchronizer` and `multi_h2d`.
 4. Work-unit metadata is registered directly via `RaidenControllerClientFacade`.
 5. Transfer is launched via `RaidenController.start_transfer`.
 
 It intentionally avoids `RaidenSynchronizer` and `RaidenHandler` so a failure here
-isolates the lower-level Raiden transport path rather than the Tunix wrappers.
+isolates the lower-level Raiden/FFI path rather than the Tunix wrappers.
 """
 
 from __future__ import annotations
@@ -34,7 +34,6 @@ import argparse
 import asyncio
 import concurrent.futures
 import ipaddress
-import math
 import os
 import socket
 import sys
@@ -97,10 +96,6 @@ def _initialize_pathways_runtime(args: argparse.Namespace) -> None:
         os_mod.environ["JAX_BACKEND_TARGET"],
     )
     pathwaysutils.initialize()
-
-
-def _is_proxy_runtime() -> bool:
-  return "proxy" in os.environ.get("JAX_PLATFORMS", "")
 
 
 def _specs() -> list[tuple[tuple[int, ...], jax.sharding.PartitionSpec, str]]:
@@ -243,22 +238,12 @@ def _build_role_arrays(role: str) -> tuple[list[jax.Array], jax.sharding.Mesh]:
   devices = np.array(jax.devices())
   specs = _specs()
   arrays: list[jax.Array] = []
-  from jax.experimental import mesh_utils
-
-  if jax.process_count() > 1:
-    sorted_devices = np.array(
-        sorted(
-            devices.tolist(),
-            key=lambda device: (device.process_index, int(device.id)),
-        )
+  if len(devices) < 16:
+    raise ValueError(
+        f"Whole-slice direct API repro requires 16 visible JAX devices, got {len(devices)}"
     )
-    mesh_shape = (jax.process_count(), jax.local_device_count())
-    mesh_devices = sorted_devices.reshape(mesh_shape)
-  else:
-    # Always set TP=4 for the single-process Pathways case.
-    mesh_shape = (len(devices) // 4, 4)
-    mesh_devices = mesh_utils.create_device_mesh(mesh_shape, devices)
-
+  from jax.experimental import mesh_utils
+  mesh_devices = mesh_utils.create_device_mesh((4, 4), devices[:16])
   mesh = jax.sharding.Mesh(mesh_devices, ("fsdp", "tp"))
   if role == "source":
     for idx, (shape, pspec, _) in enumerate(specs):
@@ -294,55 +279,32 @@ def _slice_byte_sizes(arrays: list[jax.Array], mesh: jax.sharding.Mesh) -> jax.A
   return jax.device_put(jnp.array(slice_byte_sizes, dtype=jnp.int32), sizes_sharding)
 
 
-def _host_subgrid(mesh_shape: tuple[int, ...], devices_per_host: int) -> tuple[int, ...]:
-  if len(mesh_shape) == 2:
-    if devices_per_host == 4 and mesh_shape[0] % 2 == 0 and mesh_shape[1] % 2 == 0:
-      return (2, 2)
-  elif len(mesh_shape) == 3:
-    if (
-        devices_per_host == 4
-        and mesh_shape[1] % 2 == 0
-        and mesh_shape[2] % 2 == 0
-    ):
-      return (1, 2, 2)
-
-  subgrid = [1] * len(mesh_shape)
-  remaining = devices_per_host
-  for axis in range(len(mesh_shape) - 1, -1, -1):
-    factor = math.gcd(mesh_shape[axis], remaining)
-    subgrid[axis] = factor
-    remaining //= factor
-  if remaining != 1:
-    subgrid = [1] * len(mesh_shape)
-    subgrid[-1] = devices_per_host
-  return tuple(subgrid)
-
-
-def _ffi_shard_idx(mesh: jax.sharding.Mesh) -> jax.Array:
-  task_mesh_shape = tuple(mesh.shape[a] for a in mesh.axis_names)
-  devices_per_host = _devices_per_host(np.array(mesh.devices))
-  host_subgrid = _host_subgrid(task_mesh_shape, devices_per_host)
-  host_grid = tuple(
-      mesh_dim // host_dim for mesh_dim, host_dim in zip(task_mesh_shape, host_subgrid)
+def _shard_idx(mesh: jax.sharding.Mesh, devices_per_host: int = 4) -> jax.Array:
+  task_mesh_shape = [mesh.shape[a] for a in mesh.axis_names]
+  total_devices = mesh.devices.size
+  devices_per_host = min(devices_per_host, total_devices)
+  host_subgrid, host_grid = raiden_controller.compute_host_subgrid(
+      task_mesh_shape, devices_per_host
   )
-  shard_ids = np.zeros(task_mesh_shape, dtype=np.int32)
+  coords = np.indices(task_mesh_shape)
 
-  for coords in np.ndindex(task_mesh_shape):
-    host_coords = tuple(coord // size for coord, size in zip(coords, host_subgrid))
-    local_coords = tuple(coord % size for coord, size in zip(coords, host_subgrid))
+  host_id = np.zeros(task_mesh_shape, dtype=np.int32)
+  stride = 1
+  for d in reversed(range(len(task_mesh_shape))):
+    host_coord_d = coords[d] // host_subgrid[d]
+    host_id += host_coord_d * stride
+    stride *= host_grid[d]
 
-    host_index = 0
-    for coord, dim in zip(host_coords, host_grid):
-      host_index = host_index * dim + coord
+  local_slot = np.zeros(task_mesh_shape, dtype=np.int32)
+  stride = 1
+  for d in reversed(range(len(task_mesh_shape))):
+    local_coord_d = coords[d] % host_subgrid[d]
+    local_slot += local_coord_d * stride
+    stride *= host_subgrid[d]
 
-    local_index = 0
-    for coord, dim in zip(local_coords, host_subgrid):
-      local_index = local_index * dim + coord
-
-    shard_ids[coords] = host_index * devices_per_host + local_index
-
+  global_ids = host_id * devices_per_host + local_slot
   return jax.device_put(
-      jnp.array(shard_ids, dtype=jnp.int32),
+      jnp.array(global_ids, dtype=jnp.int32),
       jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(*mesh.axis_names)),
   )
 
@@ -521,54 +483,31 @@ def _weight_sync_local_shards(
   return [f"{self_ip}:{ws.local_port}"] * num_local_dev
 
 
-def _gather_shards_across_hosts(local_shards: list[str]) -> list[str]:
-  if jax.process_count() <= 1:
-    return local_shards
-
-  encoded = []
-  for shard in local_shards:
-    encoded.append(np.frombuffer(shard.encode("ascii").ljust(64, b"\x00"), dtype=np.uint8))
-  local_tensor = jnp.array(encoded, dtype=jnp.uint8)
-  gathered = multihost_utils.process_allgather(local_tensor, tiled=False)
-  gathered_np = np.array(jax.device_get(gathered))
-
-  all_shards = []
-  for process_idx in range(jax.process_count()):
-    for local_idx in range(len(local_shards)):
-      raw = bytes(gathered_np[process_idx, local_idx]).rstrip(b"\x00")
-      all_shards.append(raw.decode("ascii"))
-  return all_shards
-
-
-def _worker_replica_id() -> int:
-  return int(
-      os.environ.get("POD_INDEX")
-      or os.environ.get("JOB_COMPLETION_INDEX")
-      or jax.process_index()
-  )
-
-
 def _run_destination_worker(args: argparse.Namespace) -> None:
   _initialize_pathways_runtime(args)
   logging.info("Visible JAX devices=%d", jax.device_count())
   arrays, mesh = _build_role_arrays(args.role)
   _log_array_snapshots("destination:before_transfer", arrays)
-  replica_id = _worker_replica_id()
+  num_local_dev = len(jax.local_devices())
+  global_shard_indices = [
+      jax.process_index() * num_local_dev + i for i in range(num_local_dev)
+  ]
   ws = weight_synchronizer.WeightSynchronizer(
       arrays,
       local_port=0,
       listener_port=0,
       unsafe_skip_buffer_lock=False,
       parallelism=args.parallelism,
+      auto_h2d=False,
+      global_shard_indices=global_shard_indices,
   )
   ctrl_client = raiden_controller.RaidenControllerClientFacade(
       args.controller_address
   )
   self_ip = _resolve_local_ip()
   shards = _weight_sync_local_shards(ws, self_ip)
-  dst_task_idx = str(replica_id)
   unit_id = raiden_controller.RaidenId(
-      "pathways_sampler", dst_task_idx, "direct_api_repro_weights"
+      "pathways_sampler", str(jax.process_index()), "direct_api_repro_weights"
   )
   mesh_shape = [mesh.shape[a] for a in mesh.axis_names]
   mesh_axes = list(mesh.axis_names)
@@ -605,11 +544,11 @@ def _run_destination_worker(args: argparse.Namespace) -> None:
       last_register_time = time.time()
     time.sleep(0.1)
   logging.info("Destination listener inactive; running H2D")
-  logging.info("Destination metrics before H2D: %s", ws.get_metrics())
+  multihost_utils.sync_global_devices("direct_api_h2d_start")
   ws.h2d()
   for arr in arrays:
     arr.block_until_ready()
-  logging.info("Destination metrics after H2D: %s", ws.get_metrics())
+  multihost_utils.sync_global_devices("direct_api_h2d_done")
   _log_array_snapshots("destination:after_h2d", arrays)
   _verify_destination(arrays)
   logging.info("Destination verification succeeded")
@@ -647,8 +586,8 @@ def _verify_destination(arrays: list[jax.Array]) -> None:
   mismatches = []
   for idx, (arr, (_, _, name)) in enumerate(zip(arrays, _specs())):
     expected = float(idx + 1)
-    arr_np = _array_to_numpy(arr)
-    if not bool(np.allclose(arr_np, expected, rtol=1e-5, atol=1e-5)):
+    if not bool(jnp.allclose(arr, expected, rtol=1e-5, atol=1e-5)):
+      arr_np = _array_to_numpy(arr)
       mismatches.append(
           (
               name,
@@ -674,7 +613,7 @@ def _run_controller_src(args: argparse.Namespace) -> None:
   )
   server = raiden_controller.RaidenControllerServer(controller)
   server.start()
-  deadline = time.time() + 120.0
+  deadline = time.time() + 1800.0
   expected_shards = 16
   while True:
     registered = set(controller._registered_shards.keys())
@@ -870,155 +809,65 @@ def _run_worker(args: argparse.Namespace) -> None:
   logging.info("Visible JAX devices=%d", jax.device_count())
   arrays, mesh = _build_role_arrays(args.role)
   _log_array_snapshots(f"{args.role}:before_transfer", arrays)
+  devices_per_host = _devices_per_host(
+      np.array(mesh.devices),
+      num_hosts=args.num_src_hosts if args.role == "source" else args.num_dst_hosts,
+  )
+  shard_idx = _shard_idx(mesh, devices_per_host=devices_per_host)
+  slice_byte_sizes = _slice_byte_sizes(arrays, mesh)
+  ws_info = _ffi_ws_info(
+      args.role,
+      arrays,
+      mesh,
+      shard_idx,
+      slice_byte_sizes,
+      args.parallelism,
+      args.num_dst_hosts,
+  )
+  gathered_ws_info = _gather_ws_info(ws_info, mesh)
+  _log_runtime_metadata(
+      args.role,
+      arrays,
+      mesh,
+      shard_idx,
+      slice_byte_sizes,
+      gathered_ws_info,
+  )
+  ips, _ = _listener_groups(gathered_ws_info)
+  unique_listeners = _register_worker_units(
+      args.role,
+      args.controller_address,
+      arrays,
+      mesh,
+      ips,
+      gathered_ws_info,
+  )
   if args.role == "source":
-    if _is_proxy_runtime():
-      devices_per_host = _devices_per_host(
-          np.array(mesh.devices), num_hosts=args.num_src_hosts
-      )
-      del devices_per_host
-      shard_idx = _ffi_shard_idx(mesh)
-      slice_byte_sizes = _slice_byte_sizes(arrays, mesh)
-      ws_info = _ffi_ws_info(
-          args.role,
-          arrays,
-          mesh,
-          shard_idx,
-          slice_byte_sizes,
-          args.parallelism,
-          args.num_dst_hosts,
-      )
-      gathered_ws_info = _gather_ws_info(ws_info, mesh)
-      _log_runtime_metadata(
-          args.role,
-          arrays,
-          mesh,
-          shard_idx,
-          slice_byte_sizes,
-          gathered_ws_info,
-      )
-      ips, _ = _listener_groups(gathered_ws_info)
-      _register_worker_units(
-          args.role,
-          args.controller_address,
-          arrays,
-          mesh,
-          ips,
-          gathered_ws_info,
-      )
-      logging.info("Source worker ready and registered; standing by.")
-      last_reg_time = time.time()
-      while True:
-        time.sleep(1)
-        if time.time() - last_reg_time > 10.0:
-          try:
-            _register_worker_units(
-                args.role,
-                args.controller_address,
-                arrays,
-                mesh,
-                ips,
-                gathered_ws_info,
-            )
-          except Exception as exc:
-            logging.warning("Periodic re-registration failed: %s", exc)
-          last_reg_time = time.time()
-
-    ws = weight_synchronizer.WeightSynchronizer(
-        arrays,
-        local_port=0,
-        listener_port=0,
-        unsafe_skip_buffer_lock=False,
-        parallelism=args.parallelism,
-    )
-    ws.d2h()
-    ctrl_client = raiden_controller.RaidenControllerClientFacade(
-        args.controller_address
-    )
-    self_ip = _resolve_local_ip()
-    shards = _weight_sync_local_shards(ws, self_ip)
-    replica_id = _worker_replica_id()
-    unit_id = raiden_controller.RaidenId(
-        "pathways_trainer", str(replica_id), "direct_api_repro_weights"
-    )
-    variable_protos = _variable_protos(arrays)
-    mesh_shape = [mesh.shape[a] for a in mesh.axis_names]
-    mesh_axes = list(mesh.axis_names)
-    ctrl_client.register_work_unit(
-        unit=unit_id,
-        shards=shards,
-        control_plane_rpc_address=f"{self_ip}:{ws.listener_port}",
-        mesh_shape=mesh_shape,
-        variables=variable_protos,
-        mesh_axes=mesh_axes,
-    )
-    logging.info(
-        "Registered source task %s listener=%s shards=%s",
-        unit_id.job_replica_id,
-        f"{self_ip}:{ws.listener_port}",
-        shards,
-    )
     logging.info("Source worker ready and registered; standing by.")
     last_reg_time = time.time()
     while True:
       time.sleep(1)
       if time.time() - last_reg_time > 10.0:
         try:
-          ctrl_client.register_work_unit(
-              unit=unit_id,
-              shards=shards,
-              control_plane_rpc_address=f"{self_ip}:{ws.listener_port}",
-              mesh_shape=mesh_shape,
-              variables=variable_protos,
-              mesh_axes=mesh_axes,
+          _register_worker_units(
+              args.role,
+              args.controller_address,
+              arrays,
+              mesh,
+              ips,
+              gathered_ws_info,
           )
         except Exception as exc:
           logging.warning("Periodic re-registration failed: %s", exc)
         last_reg_time = time.time()
-  ws = weight_synchronizer.WeightSynchronizer(
-      arrays,
-      local_port=0,
-      listener_port=0,
-      unsafe_skip_buffer_lock=False,
-      parallelism=args.parallelism,
-  )
-  ctrl_client = raiden_controller.RaidenControllerClientFacade(
-      args.controller_address
-  )
-  self_ip = _resolve_local_ip()
-  shards = _weight_sync_local_shards(ws, self_ip)
-  if jax.process_count() > 1:
-    unit_id = raiden_controller.RaidenId(
-        "pathways_trainer", "0", "direct_api_repro_weights"
-    )
-    registered_shards = _gather_shards_across_hosts(shards)
-  else:
-    unit_id = raiden_controller.RaidenId(
-        "pathways_trainer", str(jax.process_index()), "direct_api_repro_weights"
-    )
-    registered_shards = shards
-  variable_protos = _variable_protos(arrays)
-  mesh_shape = [mesh.shape[a] for a in mesh.axis_names]
-  mesh_axes = list(mesh.axis_names)
-  ctrl_client.register_work_unit(
-      unit=unit_id,
-      shards=registered_shards,
-      control_plane_rpc_address=f"{self_ip}:{ws.listener_port}",
-      mesh_shape=mesh_shape,
-      variables=variable_protos,
-      mesh_axes=mesh_axes,
-  )
-  logging.info(
-      "Registered %s unit %s listener=%s shards=%s",
-      args.role,
-      unit_id.job_replica_id,
-      f"{self_ip}:{ws.listener_port}",
-      registered_shards,
-  )
-  ws.h2d()
+  multihost_utils.sync_global_devices("direct_api_h2d_start")
+  arrays = list(raiden_ffi.multi_h2d(arrays, shard_idx, mesh))
   for arr in arrays:
     arr.block_until_ready()
+  multihost_utils.sync_global_devices("direct_api_h2d_done")
   _log_array_snapshots("destination:after_h2d", arrays)
   _verify_destination(arrays)
+  raiden_ffi.destroy_weight_synchronizer()
   logging.info("Destination verification succeeded")
 
 
