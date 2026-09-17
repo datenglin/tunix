@@ -91,6 +91,7 @@ class TensorMetadata:
   item_size: int
   layer_idx: int = 0
   sharding_spec: tuple[str, ...] = ()
+  global_shard_indices: tuple[int, ...] = ()
 
   def __post_init__(self) -> None:
     rank = len(self.shape)
@@ -186,6 +187,7 @@ class WorkUnitMetadata:
   item_size: Optional[int] = None
   variables: tuple[TensorMetadata, ...] = ()
   mesh_axes: Optional[tuple[str, ...]] = None
+  host_subgrid: Optional[tuple[int, ...]] = None
 
   @classmethod
   def from_dict(cls, d: Any) -> WorkUnitMetadata:
@@ -218,6 +220,7 @@ class WorkUnitMetadata:
                 item_size=int(v["item_size"]),
                 layer_idx=int(v.get("layer_idx", 0)),
                 sharding_spec=tuple(v.get("sharding_spec", ())),
+                global_shard_indices=tuple(v.get("global_shard_indices", ())),
             )
         )
       elif hasattr(v, "name"):
@@ -230,6 +233,7 @@ class WorkUnitMetadata:
                 item_size=int(v.item_size),
                 layer_idx=int(getattr(v, "layer_idx", 0)),
                 sharding_spec=tuple(getattr(v, "sharding_spec", ())),
+                global_shard_indices=tuple(getattr(v, "global_shard_indices", ())),
             )
         )
 
@@ -252,6 +256,11 @@ class WorkUnitMetadata:
         variables=tuple(variables),
         mesh_axes=(
             tuple(d["mesh_axes"]) if d.get("mesh_axes") is not None else None
+        ),
+        host_subgrid=(
+            tuple(d["host_subgrid"])
+            if d.get("host_subgrid") is not None
+            else None
         ),
     )
 
