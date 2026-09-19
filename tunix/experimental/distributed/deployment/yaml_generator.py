@@ -44,6 +44,16 @@ def main() -> None:
       default=None,
       help="CPU machine type (e.g. n2-standard-64)",
   )
+  parser.add_argument(
+      "--namespace",
+      default=os.environ.get("K8S_NAMESPACE", "default"),
+      help="Kubernetes namespace to deploy into.",
+  )
+  parser.add_argument(
+      "--queue_name",
+      default=os.environ.get("KUEUE_QUEUE_NAME", ""),
+      help="Kueue local queue name for scheduling (optional).",
+  )
 
   parser.add_argument(
       "--pathways_server_image",
@@ -66,6 +76,36 @@ def main() -> None:
       "--pathways_proxy_memory_limit",
       default="100G",
       help="Memory limit of the Pathways proxy container",
+  )
+  parser.add_argument(
+      "--pathways_proxy_memory",
+      default="16G",
+      help=(
+          "Memory request for the Pathways proxy container. Kept well below"
+          " --pathways_proxy_memory_limit: requests are the scheduling floor,"
+          " and the head pod is co-located with pw-node via podAffinity, so"
+          " requesting the full limit over-reserves the node."
+      ),
+  )
+  parser.add_argument(
+      "--pathways_rm_memory",
+      default="4G",
+      help="Memory request for the pathways-rm container",
+  )
+  parser.add_argument(
+      "--user_container_memory",
+      default="48G",
+      help="Memory request for the user/worker container",
+  )
+  parser.add_argument(
+      "--user_container_memory_limit",
+      default="70G",
+      help="Memory limit for the user/worker container",
+  )
+  parser.add_argument(
+      "--pathways_worker_memory",
+      default="100G",
+      help="Memory request for the pathways-worker container",
   )
 
   parser.add_argument(
@@ -99,8 +139,6 @@ def main() -> None:
   slice_topology = None
   slice_size = None
   pw_instance_type = None
-  tpu_chips_per_worker = 4
-  affinity_block = """affinity:\n              podAffinity:\n                requiredDuringSchedulingIgnoredDuringExecution:\n                - topologyKey: cloud.google.com/gke-nodepool\n                  labelSelector:\n                    matchExpressions:\n                    - key: jobset.sigs.k8s.io/jobset-name\n                      operator: In\n                      values:\n                      - ${JOBSET_NAME}\n              podAntiAffinity:\n                requiredDuringSchedulingIgnoredDuringExecution:\n                - topologyKey: cloud.google.com/gke-nodepool\n                  labelSelector:\n                    matchExpressions:\n                    - key: jobset.sigs.k8s.io/jobset-name\n                      operator: Exists\n                    - key: jobset.sigs.k8s.io/jobset-name\n                      operator: NotIn\n                      values:\n                      - ${JOBSET_NAME}"""
   if args.tpu_slice and args.tpu_slice != ":":
     tpu_type, tpu_topology = args.tpu_slice.split(":")
     num_chips = math.prod([int(d) for d in tpu_topology.split("x")])
@@ -112,7 +150,7 @@ def main() -> None:
       tpu_machine = "tpu7x-standard-4t"
       tpu_type = "tpu7x"
       pw_instance_type = "tpu7x"
-    elif tpu_type in ("tpuv5", "tpu-v5p-slice"):
+    elif tpu_type in ("tpuv5", "tpuv5p", "tpu-v5p-slice"):
       slice_topology = tpu_topology
       slice_size = num_chips // 4
       tpu_machine = "ct5p-hightpu-4t"
@@ -122,12 +160,6 @@ def main() -> None:
       slice_topology = tpu_topology
       slice_size = num_chips // 4
       tpu_machine = "ct5lp-hightpu-4t"
-      if tpu_topology == "2x4":
-        # Single-host v5e 2x4 slices expose one 8-chip host per slice.
-        slice_size = 1
-        tpu_machine = "ct5lp-hightpu-8t"
-        tpu_chips_per_worker = 8
-        affinity_block = """affinity:\n              podAntiAffinity:\n                requiredDuringSchedulingIgnoredDuringExecution:\n                - topologyKey: cloud.google.com/gke-nodepool\n                  labelSelector:\n                    matchExpressions:\n                    - key: jobset.sigs.k8s.io/jobset-name\n                      operator: In\n                      values:\n                      - ${JOBSET_NAME}\n                - topologyKey: cloud.google.com/gke-nodepool\n                  labelSelector:\n                    matchExpressions:\n                    - key: jobset.sigs.k8s.io/jobset-name\n                      operator: Exists\n                    - key: jobset.sigs.k8s.io/jobset-name\n                      operator: NotIn\n                      values:\n                      - ${JOBSET_NAME}"""
       tpu_type = "tpu-v5-lite-podslice"
       pw_instance_type = "tpuv5e"
     elif tpu_type in ("tpuv6e", "tpu-v6e-slice"):
@@ -149,15 +181,31 @@ def main() -> None:
   if args.jobset_name is None:
     jobset_name = f"{os.environ.get('USER')}-{pw_instance_type}-{num_chips}"
 
+  priority_class = getattr(args, "priority_class", "") or os.environ.get("PRIORITY_CLASS", "medium")
+  labels = []
+  if args.queue_name:
+    labels.append(f"    kueue.x-k8s.io/queue-name: {args.queue_name}")
+  if priority_class:
+    labels.append(f"    kueue.x-k8s.io/priority-class: {priority_class}")
+  queue_label = chr(10).join(["  labels:"] + labels) + chr(10) if labels else ""
+
   with open(args.template_file, "r") as f:
     template = string.Template(f.read())
     content = template.substitute(
         JOBSET_NAME=jobset_name,
         USER=os.environ.get("USER"),
+        NAMESPACE=args.namespace,
+        QUEUE_NAME=args.queue_name,
+        QUEUE_LABEL=queue_label,
         SERVER_IMAGE=args.pathways_server_image,
         PROXY_IMAGE=args.pathways_proxy_server_image,
         GCS_SCRATCH_LOCATION=args.pathways_gcs_scratch_location,
         PATHWAYS_PROXY_MEMORY_LIMIT=args.pathways_proxy_memory_limit,
+        PATHWAYS_PROXY_MEMORY=args.pathways_proxy_memory,
+        PATHWAYS_RM_MEMORY=args.pathways_rm_memory,
+        USER_CONTAINER_MEMORY=args.user_container_memory,
+        USER_CONTAINER_MEMORY_LIMIT=args.user_container_memory_limit,
+        PATHWAYS_WORKER_MEMORY=args.pathways_worker_memory,
         CPU_MACHINE=args.cpu_machine,
         TPU_MACHINE=tpu_machine,
         TPU_TYPE=tpu_type,
@@ -168,10 +216,6 @@ def main() -> None:
         PARALLELISM=num_chips // 4 if num_chips else None,
         PODSET_SLICE_TOPOLOGY=slice_topology,
         PODSET_SLICE_SIZE=slice_size,
-        TPU_CHIPS_PER_WORKER=tpu_chips_per_worker,
-        AFFINITY_BLOCK=string.Template(affinity_block).substitute(
-          JOBSET_NAME=jobset_name,
-        ),
         USER_CONTAINER=args.worker_container_name,
         USER_CONTAINER_IMAGE=args.worker_container_image,
         USER_CONTAINER_PORT=args.worker_container_port,

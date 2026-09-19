@@ -17,17 +17,20 @@
 from __future__ import annotations
 
 import collections
+import dataclasses
 import inspect
 import ipaddress
 import os
+import re
 import socket
 from typing import Any, List, Optional, Tuple
 
 from absl import logging
 import jax
-# from jax.experimental import compute_on
+from jax.experimental import compute_on
 import jax.numpy as jnp
 from tunix.experimental.weight_sync import weight_sync
+from tunix.utils import mesh
 
 
 def _log_rss(tag: str) -> None:
@@ -48,67 +51,91 @@ def _log_rss(tag: str) -> None:
   )
 
 
-_ws_lib: Any = None
-try:
-  from tpu_sync.api.jax import weight_synchronizer as _ws_lib  # pytype: disable=import-error  pylint: disable=g-import-not-at-top
-except ImportError:
-  _ws_lib = None
+_lazy_modules: dict[str, Any] = {}
 
-_raiden_ffi: Any = None
-try:
-  from tpu_sync.frameworks.jax import weight_synchronizer_ffi as _raiden_ffi  # pytype: disable=import-error  pylint: disable=g-import-not-at-top
-except ImportError:
-  _raiden_ffi = None
+
+def _lazy_import_module(module_path: str) -> Any:
+  """Imports a module lazily by path, caching the result."""
+  if module_path not in _lazy_modules:
+    try:
+      import importlib  # pylint: disable=g-import-not-at-top
+
+      _lazy_modules[module_path] = importlib.import_module(module_path)
+    except ImportError:
+      _lazy_modules[module_path] = None
+  return _lazy_modules[module_path]
+
+
+def _get_ws_lib() -> Any:
+  """Imports tpu_sync weight_synchronizer lazily to prevent early C++ library symbol collisions."""
+  if "_ws_lib" in globals():
+    return globals()["_ws_lib"]
+  mod = _lazy_import_module(
+      "google3.third_party.tpu_raiden.tpu_sync.api.jax.weight_synchronizer"
+  )
+  if mod is None:
+    mod = _lazy_import_module("tpu_sync.api.jax.weight_synchronizer")
+  return mod
+
+
+def _get_raiden_ffi() -> Any:
+  """Imports tpu_sync weight_synchronizer_ffi lazily to avoid loading XLA runtime early."""
+  if "_raiden_ffi" in globals():
+    return globals()["_raiden_ffi"]
+  mod = _lazy_import_module(
+      "google3.third_party.tpu_raiden.tpu_sync.frameworks.jax.weight_synchronizer_ffi"
+  )
+  if mod is None:
+    mod = _lazy_import_module("tpu_sync.frameworks.jax.weight_synchronizer_ffi")
+  return mod
+
+
+def __getattr__(name: str) -> Any:
+  if name == "_raiden_ffi":
+    return _get_raiden_ffi()
+  if name == "_ws_lib":
+    return _get_ws_lib()
+  raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _ensure_ffi_compute_on_compat() -> None:
   """Bridges TPU-sync wheels that call the newer compute_on decorator API."""
-  experimental_compute_on_mod = None
+  compute_on_mod = getattr(jax, "_src", None)
+  if compute_on_mod is None:
+    return
+  compute_on_mod = getattr(compute_on_mod, "compute_on", None)
+  if compute_on_mod is None:
+    return
+
   try:
-    from jax.experimental import compute_on as experimental_compute_on_mod  # pytype: disable=import-error  pylint: disable=g-import-not-at-top
-  except ImportError:
-    experimental_compute_on_mod = None
-
-  internal_compute_on_mod = getattr(jax, "_src", None)
-  if internal_compute_on_mod is not None:
-    internal_compute_on_mod = getattr(internal_compute_on_mod, "compute_on", None)
-
-  compute_on_modules = [
-      module
-      for module in (experimental_compute_on_mod, internal_compute_on_mod)
-      if module is not None
-  ]
-  if not compute_on_modules:
+    params = inspect.signature(compute_on_mod.compute_on).parameters
+  except (TypeError, ValueError):
+    params = {}
+  if "out_memory_spaces" in params:
     return
 
-  needs_patch = False
-  for compute_on_mod in compute_on_modules:
-    try:
-      params = inspect.signature(compute_on_mod.compute_on).parameters
-    except (TypeError, ValueError):
-      params = {}
-    if "out_memory_spaces" not in params:
-      needs_patch = True
-      break
-  if not needs_patch:
-    return
-
-  compute_on2 = None
-  for compute_on_mod in compute_on_modules:
-    compute_on2 = getattr(compute_on_mod, "compute_on2", None)
-    if compute_on2 is not None:
-      break
+  compute_on2 = getattr(compute_on_mod, "compute_on2", None)
   if compute_on2 is None:
     raise RuntimeError(
         "Installed JAX lacks compute_on compatibility required by the TPU-sync"
         " FFI wheel."
     )
 
-  for compute_on_mod in compute_on_modules:
-    compute_on_mod.compute_on = compute_on2
+  compute_on_mod.compute_on = compute_on2
+  # The wheel does `from jax.experimental import compute_on` and then calls
+  # `compute_on.compute_on(...)`. jax.experimental.compute_on binds the name at
+  # import time, so patching jax._src alone leaves the caller on the old
+  # two-arg version and the decorator dies with
+  #   TypeError: compute_on() got an unexpected keyword argument 'out_memory_spaces'
+  try:
+    from jax.experimental import compute_on as _public_compute_on  # pytype: disable=import-error  pylint: disable=g-import-not-at-top
+
+    _public_compute_on.compute_on = compute_on2
+  except ImportError:
+    pass
   logging.warning(
-      "Patched JAX compute_on entrypoints to compute_on2 for TPU-sync FFI"
-      " compatibility."
+      "Patched jax._src.compute_on.compute_on (and jax.experimental."
+      "compute_on) to compute_on2 for TPU-sync FFI compatibility."
   )
 
 
@@ -152,6 +179,36 @@ def flatten_weights(state: Any) -> Tuple[List[str], List[Any]]:
   return names, arrays
 
 
+# One bracketed component (`['w']`, `[0]`) or one dotted component (`w`).
+_PATH_COMPONENT_RE = re.compile(r"\[([^\]]*)\]|([^.\[\]]+)")
+# A trailing ordinal folded into the name, as in `layers_0`.
+_FOLDED_INDEX_RE = re.compile(r"^(.+?)_(\d+)$")
+
+
+def _param_key(name: str) -> str:
+  """Canonical dotted key for pairing a bound name with a runner tree path.
+
+  The two sides spell the same parameter differently: `flatten_weights` reports
+  JAX keystr (`['layers'][0]['w']`), callers pass bare names (`w1`) or
+  attribute paths (`layers.0.w`), and unscanned MaxText layers arrive with the
+  ordinal folded in (`layers_0`). Reducing every form to `layers.0.w` lets the
+  match ignore which side produced the name.
+  """
+  segments: List[str] = []
+  for bracketed, dotted in _PATH_COMPONENT_RE.findall(name):
+    component = (bracketed or dotted).strip("'\"")
+    if not component:
+      continue
+    folded = _FOLDED_INDEX_RE.match(component)
+    segments.extend(folded.groups() if folded else (component,))
+  # Wrapper roots and the nnx `.value` leaf are not part of the identity.
+  while segments and segments[0] in ("base", "model"):
+    segments.pop(0)
+  if segments and segments[-1] == "value":
+    segments.pop()
+  return ".".join(segments)
+
+
 def _bindable(arr: Any, *, allow_proxy: bool = False) -> bool:
   """True if the native layer can bind this leaf.
 
@@ -178,10 +235,26 @@ def _bindable(arr: Any, *, allow_proxy: bool = False) -> bool:
     return False
 
 
+_KV_CACHE_SEGMENTS = frozenset(
+    {"cache", "cached_prefill_key", "cached_prefill_value"}
+)
+
+
+def _is_kv_cache(name: str) -> bool:
+  """True for inference KV-cache buffers, which are not weights.
+
+  The rollout's MaxText model carries per-layer KV cache arrays
+  (`...['attention']['cache']['cached_prefill_key']`). They are floating point
+  and rank>=1, so `_bindable` accepts them, but the trainer has no counterpart
+  and manifest preflight then rejects them as destination-only variables.
+  """
+  return any(seg in _KV_CACHE_SEGMENTS for seg in _param_key(name).split("."))
+
+
 def _filter_bindable(
     names: List[str], arrays: List[Any], *, allow_proxy: bool = False
 ) -> Tuple[List[str], List[Any]]:
-  """Drops leaves _bindable rejects."""
+  """Drops leaves _bindable rejects, plus inference-only KV cache buffers."""
   logging.vlog(
       1,
       "raiden bind census: %s",
@@ -192,13 +265,22 @@ def _filter_bindable(
   keep_names: List[str] = []
   keep_arrays: List[Any] = []
   dropped = []
+  cache_dropped = []
   for name, arr in zip(names, arrays):
-    if _bindable(arr, allow_proxy=allow_proxy):
+    if _is_kv_cache(name):
+      cache_dropped.append(name)
+    elif _bindable(arr, allow_proxy=allow_proxy):
       arr.block_until_ready()
       keep_names.append(name)
       keep_arrays.append(arr)
     else:
       dropped.append(name)
+  if cache_dropped:
+    logging.debug(
+        "raiden bind skipped %d KV-cache leaves: %s",
+        len(cache_dropped),
+        cache_dropped[:5],
+    )
   if dropped:
     logging.warning(
         "raiden bind dropped %d unbindable leaves: %s", len(dropped), dropped[:5]
@@ -214,55 +296,64 @@ def _axis_name(axis: Any) -> str:
   return ",".join(axis)
 
 
+def _devices_per_host(devices: List[Any]) -> int:
+  """Devices sharing one physical host, i.e. Raiden's `num_shards`.
 
-def _compute_global_shard_index(
-    slice_tuple: Any,
-    global_shape: Sequence[int],
-    sharding_shape: Sequence[int],
-) -> int:
-  if not slice_tuple:
-    return 0
-  global_idx = 0
-  stride = 1
-  for sl, g_dim, m_dim in zip(
-      reversed(slice_tuple), reversed(global_shape), reversed(sharding_shape)
-  ):
-    if m_dim > 1:
-      tile_size = g_dim // m_dim
-      start = (
-          sl.start
-          if isinstance(sl, slice) and sl.start is not None
-          else (sl if isinstance(sl, int) else 0)
-      )
-      coord = start // tile_size if tile_size > 0 else 0
-      global_idx += coord * stride
-      stride *= m_dim
-  return global_idx
+  The native layer derives `submanager_idx = shard_idx / num_shards` and
+  `slot = shard_idx % num_shards`, so this must be the real per-host device
+  count. Overstate it and every host allocates staging for the whole slice but
+  fills only its own share, leaving the rest of its SetGlobalShardIndices at
+  -1 -- the transfer then completes green while delivering only the shards one
+  host happened to own.
 
-def _tensor_metadata(name: str, arr: Any, layer_idx: int, target_devices: Optional[Sequence[Any]] = None):
+  Groups by host key (resolving Pathways `logical_task` or `process_index` via
+  mesh topology).
+  """
+  host_keys = [mesh.device_host_key(d) for d in devices]
+  per_host = collections.Counter(k for k in host_keys if k is not None)
+  per_task = collections.Counter(getattr(d, "task_id", None) for d in devices)
+  del per_task[None]
+  if len(per_task) > len(per_host):
+    per_host = per_task
+
+  if not per_host:
+    logging.warning(
+        "no host or task metadata on any of %d device(s); assuming a single"
+        " host",
+        len(devices),
+    )
+    return len(devices)
+  counts = set(per_host.values())
+  if len(counts) > 1:
+    # No right answer for a ragged slice; understating only wastes staging,
+    # overstating drops another host's shards.
+    logging.warning(
+        "uneven devices per host %s; using the smallest (%d)",
+        dict(per_host),
+        min(counts),
+    )
+    return min(counts)
+  return counts.pop()
+
+
+def _tensor_metadata(name: str, arr: Any, layer_idx: int):
   sharding: Any = getattr(arr, "sharding", None)
   spec = tuple(getattr(sharding, "spec", ()) or ())
   spec = (spec + (None,) * arr.ndim)[: arr.ndim]
-  try:
-    local = sharding.shard_shape(tuple(arr.shape))
-    mesh_shape = tuple(g // l for g, l in zip(arr.shape, local))
-  except Exception:  # pylint: disable=broad-exception-caught
-    mesh_shape = (1,) * arr.ndim
-
-  global_shard_indices: tuple[int, ...] = ()
-  if target_devices and sharding is not None and hasattr(sharding, "devices_indices_map"):
+  if sharding is not None and hasattr(sharding, "shard_shape"):
     try:
-      device_to_slice = sharding.devices_indices_map(arr.shape)
-      global_shard_indices = tuple(
-          _compute_global_shard_index(
-              device_to_slice.get(d), arr.shape, mesh_shape
-          )
-          for d in target_devices
+      local = sharding.shard_shape(tuple(arr.shape))
+      mesh_shape = tuple(g // l for g, l in zip(arr.shape, local))
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      logging.warning(
+          "Could not compute mesh_shape for %s from sharding: %s, falling back"
+          " to 1D",
+          name,
+          e,
       )
-    except Exception as e:
-      logging.warning("Could not compute global_shard_indices for %s: %s", name, e)
-      global_shard_indices = ()
-
+      mesh_shape = (1,) * arr.ndim
+  else:
+    mesh_shape = (1,) * arr.ndim
   return weight_sync.TensorMetadata(
       name=name,
       shape=tuple(arr.shape),
@@ -271,8 +362,37 @@ def _tensor_metadata(name: str, arr: Any, layer_idx: int, target_devices: Option
       item_size=arr.dtype.itemsize,
       layer_idx=layer_idx,
       sharding_spec=tuple(_axis_name(a) for a in spec),
-      global_shard_indices=global_shard_indices,
   )
+
+
+def _compute_host_subgrid(
+    array_mesh: Optional[Any],
+) -> Optional[Tuple[int, ...]]:
+  """Extracts host_subgrid from environment or the local JAX mesh devices.
+
+  Args:
+    array_mesh: Optional JAX Mesh associated with the bound arrays.
+
+  Returns:
+    A tuple of integers representing the host subgrid shape, or None.
+  """
+  host_subgrid_env = os.environ.get("RAIDEN_HOST_SUBGRID")
+  if host_subgrid_env:
+    try:
+      return tuple(int(x.strip()) for x in host_subgrid_env.split(","))
+    except ValueError:
+      pass
+  if array_mesh is not None:
+    try:
+      if (
+          hasattr(array_mesh, "local_mesh")
+          and array_mesh.local_mesh is not None
+          and hasattr(array_mesh.local_mesh, "devices")
+      ):
+        return tuple(array_mesh.local_mesh.devices.shape)
+    except (AttributeError, ValueError, TypeError):
+      pass
+  return None
 
 
 class RaidenSynchronizer:
@@ -280,9 +400,8 @@ class RaidenSynchronizer:
 
   Used by both the trainer and the sampler. Construct with a state to bind
   right away, or leave it out and call `bind` when the weights exist; every
-  later `bind` rebinds the same transport. Known limits: one mesh axis per
-  tensor dim, and without the tpu_sync wheel the metadata carries no shard
-  addresses, so the handler refuses registration.
+  later `bind` rebinds the same transport. Without the tpu_sync wheel the
+  metadata carries no shard addresses, so the handler refuses registration.
   """
 
   def __init__(
@@ -307,6 +426,7 @@ class RaidenSynchronizer:
     self._sync: Any = None
     self._ips: List[str] = []
     self._unique_listeners: List[str] = []
+    self._listeners: List[str] = []
     self._ffi_mesh: Any = None
     self._ffi_shard_idx: Any = None
     self._host_subgrid: Optional[Tuple[int, ...]] = None
@@ -319,6 +439,10 @@ class RaidenSynchronizer:
 
   @property
   def active(self) -> bool:
+    # Under FFI there is no native `_sync` and `_ips` fill only in d2h(), so
+    # bound arrays are the only pre-d2h signal. MaxText gates d2h() on this.
+    if self._is_proxy:
+      return self.bound
     return self._sync is not None or bool(self._ips)
 
   def _init_ffi_transport(self, *, is_d2h: bool) -> None:
@@ -326,7 +450,8 @@ class RaidenSynchronizer:
       raise RuntimeError(
           f"{self.job_name}: bind() must stage arrays before FFI init"
       )
-    if _raiden_ffi is None:
+    raiden_ffi = _get_raiden_ffi()
+    if raiden_ffi is None:
       raise RuntimeError(
           "weight_synchronizer_ffi is not available for FFI weight sync."
       )
@@ -351,11 +476,17 @@ class RaidenSynchronizer:
     )
 
     task_mesh_shape = tuple(mesh.shape[a] for a in mesh.axis_names)
-    # Use mesh position rather than physical device id. create_device_mesh may
-    # reorder devices for topology, so device ids can diverge from the global
-    # shard indices the controller computes from mesh position.
+    # Mesh POSITION, not device id. The controller indexes a source shard by
+    # its position in the mesh (`_get_global_indices` walks
+    # physical_mesh_shape), while the native layer keys staging off whatever we
+    # pass here -- slot = shard_idx % num_shards, submanager = shard_idx /
+    # num_shards, and SetGlobalShardIndices records it as the global index.
+    # create_device_mesh reorders devices for topology (a 2x2x2 v5p slice comes
+    # back as ids [0,1,3,2,6,7,5,4]), so keying off d.id labels each slice with
+    # the wrong global index. A 2x2x1 slice happens to be identity-ordered,
+    # which is why this only ever showed up multi-host.
     global_ids = jnp.arange(mesh.devices.size, dtype=jnp.int32).reshape(
-      task_mesh_shape
+        task_mesh_shape
     )
     shard_idx = jax.device_put(
         global_ids,
@@ -365,65 +496,24 @@ class RaidenSynchronizer:
     )
 
     src_devices = mesh.devices.flatten()
-    devices_per_host_env = os.environ.get("RAIDEN_DEVICES_PER_HOST")
-    if devices_per_host_env:
-      devices_per_host = int(devices_per_host_env)
-    elif self._is_proxy:
-      # In Pathways, process_index is always 0 for proxy devices. Default to
-      # 4 devices/host for standard Cloud TPU VM topologies.
-      devices_per_host = min(4, len(src_devices))
-    else:
-      num_processes = len(
-          set(getattr(d, "process_index", 0) for d in src_devices)
-      )
-      devices_per_host = len(src_devices) // max(1, num_processes)
-
-    host_subgrid = None
-    host_subgrid_env = os.environ.get("RAIDEN_HOST_SUBGRID")
-    if host_subgrid_env:
-      try:
-        host_subgrid = [int(x.strip()) for x in host_subgrid_env.split(",")]
-      except ValueError:
-        pass
-    if host_subgrid is None:
-      try:
-        if (
-            hasattr(mesh, "local_mesh")
-            and mesh.local_mesh is not None
-            and hasattr(mesh.local_mesh, "devices")
-        ):
-          host_subgrid = list(mesh.local_mesh.devices.shape)
-      except (AttributeError, ValueError, TypeError):
-        host_subgrid = None
-    if host_subgrid is None:
-      if len(task_mesh_shape) > 1 and task_mesh_shape[1] == devices_per_host:
-        host_subgrid = [1, devices_per_host]
-      elif hasattr(_raiden_ffi, "compute_host_subgrid"):
-        host_subgrid, _ = _raiden_ffi.compute_host_subgrid(
-            list(task_mesh_shape), devices_per_host
-        )
-      else:
-        try:
-          from tpu_sync.rpc import raiden_controller as _rc  # pylint: disable=g-import-not-at-top
-          host_subgrid, _ = _rc.compute_host_subgrid(
-              list(task_mesh_shape), devices_per_host
-          )
-        except Exception:
-          host_subgrid = None
-
-    self._host_subgrid = (
-        tuple(host_subgrid) if host_subgrid is not None else None
+    devices_per_host = _devices_per_host(list(src_devices))
+    # Loud on purpose: a wrong value here is silent, and costs exactly the
+    # shards of every host but one.
+    logging.warning(
+        "raiden ffi: %d device(s), devices_per_host=%d (task_id=%s)",
+        len(src_devices),
+        devices_per_host,
+        sorted({getattr(d, "task_id", None) for d in src_devices}, key=str),
     )
 
     if is_d2h:
       logging.info(
           "Initializing Pathways weight synchronizer and executing D2H via FFI"
-          " (%d layers, %d devices/host, host_subgrid=%s)",
+          " (%d layers, %d devices/host)",
           len(self.arrays),
           devices_per_host,
-          host_subgrid,
       )
-      ws_info = _raiden_ffi.init_weight_synchronizer_and_d2h(
+      ws_info = raiden_ffi.init_weight_synchronizer_and_d2h(
           device_arrays=self.arrays,
           shard_idx=shard_idx,
           mesh=mesh,
@@ -432,7 +522,6 @@ class RaidenSynchronizer:
           num_layers=len(self.arrays),
           listener_port=0,
           num_shards=devices_per_host,
-          host_subgrid=host_subgrid,
       )
     else:
       logging.info(
@@ -444,49 +533,49 @@ class RaidenSynchronizer:
 
       # TODO(b/557061810): Re-enable this once the bug is fixed and the FFI
       # call is verified to work.
-      ws_info = _raiden_ffi.init_weight_synchronizer(
-          device_array=self.arrays[0],
-          shard_idx=shard_idx,
-          mesh=mesh,
-          slice_byte_sizes=slice_byte_sizes_sharded,
-          parallelism=self._parallelism,
-          num_layers=len(self.arrays),
-          listener_port=0,
-          num_shards=devices_per_host,
-      )
-
-      # @compute_on.compute_on(
-      #     compute_type="device_host",
-      #     out_memory_spaces=jax.memory.Space.Device,
-      # )
-      # def _local_init(anchor, s_idx, sizes):
-      #   axis_names = mesh.axis_names
-      #   out_shape = tuple([1] * len(axis_names)) + (6,)
-      #   return jax.ffi.ffi_call(
-      #       "init_weight_synchronizer",
-      #       jax.ShapeDtypeStruct(out_shape, jnp.int32),
-      #       has_side_effect=True,
-      #   )(
-      #       anchor,
-      #       s_idx,
-      #       sizes,
-      #       local_port=np.int32(0),
-      #       parallelism=np.int32(self._parallelism),
-      #       num_layers=np.int32(len(self.arrays)),
-      #       listener_port=np.int32(0),
-      #       num_shards=np.int32(devices_per_host),
-      #   )
-
-      # ws_info = jax.shard_map(
-      #     _local_init,
+      # ws_info = _raiden_ffi.init_weight_synchronizer(
+      #     device_array=self.arrays[0],
+      #     shard_idx=shard_idx,
       #     mesh=mesh,
-      #     in_specs=(
-      #         self.arrays[0].sharding.spec,
-      #         jax.sharding.PartitionSpec(*mesh.axis_names),
-      #         jax.sharding.PartitionSpec(None),
-      #     ),
-      #     out_specs=jax.sharding.PartitionSpec(*mesh.axis_names, None),
-      # )(self.arrays[0], shard_idx, slice_byte_sizes_sharded)
+      #     slice_byte_sizes=slice_byte_sizes_sharded,
+      #     parallelism=self._parallelism,
+      #     num_layers=len(self.arrays),
+      #     listener_port=0,
+      #     num_shards=devices_per_host,
+      # )
+
+      @compute_on.compute_on(
+          compute_type="device_host",
+          out_memory_spaces=jax.memory.Space.Device,
+      )
+      def _local_init(anchor, s_idx, sizes):
+        axis_names = mesh.axis_names
+        out_shape = tuple([1] * len(axis_names)) + (6,)
+        return jax.ffi.ffi_call(
+            "init_weight_synchronizer",
+            jax.ShapeDtypeStruct(out_shape, jnp.int32),
+            has_side_effect=True,
+        )(
+            anchor,
+            s_idx,
+            sizes,
+            local_port=np.int32(0),
+            parallelism=np.int32(self._parallelism),
+            num_layers=np.int32(len(self.arrays)),
+            listener_port=np.int32(0),
+            num_shards=np.int32(devices_per_host),
+        )
+
+      ws_info = jax.shard_map(
+          _local_init,
+          mesh=mesh,
+          in_specs=(
+              self.arrays[0].sharding.spec,
+              jax.sharding.PartitionSpec(*mesh.axis_names),
+              jax.sharding.PartitionSpec(None),
+          ),
+          out_specs=jax.sharding.PartitionSpec(*mesh.axis_names, None),
+      )(self.arrays[0], shard_idx, slice_byte_sizes_sharded)
 
     local_ws_info = multihost_utils.global_array_to_host_local_array(
         ws_info,
@@ -502,26 +591,39 @@ class RaidenSynchronizer:
       ip = unpack_ip(row)
       self._ips.append(f"{ip}:{int(row[4])}")
       listeners.append(f"{ip}:{int(row[5])}")
+    self._listeners = listeners
 
     self._unique_listeners = []
     for listener in listeners:
       if listener not in self._unique_listeners:
         self._unique_listeners.append(listener)
+    # The controller addresses source shard j by shards[j], indexing by MESH
+    # position; this list is assembled by process_allgather, which orders by
+    # PROCESS. Under Pathways there is a single client process, so verify both
+    # that all devices reported and that entry j lines up with mesh device j.
+    logging.warning(
+        "raiden ffi endpoints: %d row(s) for %d mesh device(s); mesh ids=%s;"
+        " endpoints=%s",
+        len(gathered_ws_info),
+        len(src_devices),
+        [d.id for d in src_devices],
+        self._ips,
+    )
     self._ffi_mesh = mesh
     self._ffi_shard_idx = shard_idx
 
   def _ffi_h2d(self) -> None:
-    if _raiden_ffi is None:
+    raiden_ffi = _get_raiden_ffi()
+    if raiden_ffi is None:
       raise RuntimeError(
           "weight_synchronizer_ffi is not available for FFI weight sync."
       )
     if self._ffi_mesh is None or self._ffi_shard_idx is None:
       raise RuntimeError(f"{self.job_name}: bind() must run before h2d()")
     self.arrays = list(
-        _raiden_ffi.multi_h2d(self.arrays, self._ffi_shard_idx, self._ffi_mesh)
+        raiden_ffi.multi_h2d(self.arrays, self._ffi_shard_idx, self._ffi_mesh)
     )
-    for arr in self.arrays:
-      arr.block_until_ready()
+    jax.block_until_ready(self.arrays)
 
   def bind(self, state: Any) -> None:
     """Binds this host's weights, or rebinds them after a training step."""
@@ -531,10 +633,19 @@ class RaidenSynchronizer:
     self.names = []
     self.arrays = []
     self.names, self.arrays = _filter_bindable(
-        *flatten_weights(state), allow_proxy=self._is_proxy
+        # Proxy arrays are bindable only under FFI, which binds them in place;
+        # a non-Pathways process should not be seeing them at all.
+        *flatten_weights(state),
+        allow_proxy=self._is_proxy,
     )
     del state
     _log_rss("bind:after_flatten")
+    array_mesh = None
+    for arr in self.arrays:
+      array_mesh = getattr(getattr(arr, "sharding", None), "mesh", None)
+      if array_mesh is not None:
+        break
+    self._host_subgrid = _compute_host_subgrid(array_mesh)
     logging.info(
         "%s bind prepared %d arrays (proxy_runtime=%s)",
         self.job_name,
@@ -553,7 +664,8 @@ class RaidenSynchronizer:
             self._unique_listeners,
         )
       return
-    if _ws_lib is None:
+    ws_lib = _get_ws_lib()
+    if ws_lib is None:
       return
     if self._sync is None:
       logging.info(
@@ -561,7 +673,7 @@ class RaidenSynchronizer:
           self.job_name,
           len(self.arrays),
       )
-      self._sync = _ws_lib.WeightSynchronizer(
+      self._sync = ws_lib.WeightSynchronizer(
           self.arrays,
           local_port=0,
           parallelism=self._parallelism,
@@ -588,7 +700,12 @@ class RaidenSynchronizer:
 
   def _require_sync(self, op: str) -> Any:
     if self._sync is None and not self._is_proxy:
-      raise RuntimeError(f"{self.job_name}: bind() must run before {op}")
+      if not self.bound:
+        raise RuntimeError(f"{self.job_name}: bind() must run before {op}")
+      raise RuntimeError(
+          f"{self.job_name}: tpu_sync native weight_synchronizer library "
+          "(_ws_lib) could not be loaded."
+      )
     return self._sync
 
   def d2h(self) -> None:
@@ -621,6 +738,104 @@ class RaidenSynchronizer:
       self._sync.h2d()
       jax.block_until_ready(self.arrays)
 
+  # TODO(tunix-dev): drop this once bind() records the runner's leaf identity so
+  # h2d() writes back in place, making the name matching below unnecessary.
+  def apply_to_runner(self, runner: Any) -> None:
+    """Applies updated arrays after H2D to the runner's state_leaves and state."""
+    if runner is None or not self.arrays:
+      return
+    if not hasattr(runner, "state_leaves") or runner.state_leaves is None:
+      raise ValueError(
+          f"{self.job_name}: runner does not have a valid 'state_leaves'"
+          " attribute."
+      )
+    if not hasattr(runner, "state") or runner.state is None:
+      raise ValueError(
+          f"{self.job_name}: runner does not have a valid 'state' attribute."
+      )
+
+    new_leaves = list(runner.state_leaves)
+    runner_leaves_with_path = list(
+        jax.tree_util.tree_leaves_with_path(runner.state)
+    )
+    if len(new_leaves) != len(runner_leaves_with_path):
+      raise RuntimeError(
+          f"{self.job_name}: runner.state_leaves length ({len(new_leaves)})"
+          " does not match runner.state leaves count"
+          f" ({len(runner_leaves_with_path)})."
+      )
+
+    key_to_entries: dict[str, List[Any]] = collections.defaultdict(list)
+    for idx, (name, arr) in enumerate(zip(self.names, self.arrays)):
+      key_to_entries[_param_key(name)].append((idx, name, arr))
+
+    matched_indices = set()
+
+    def _claim(key: str):
+      """First unapplied array whose key equals, or is a suffix of, `key`."""
+      for entry in key_to_entries.get(key, ()):
+        if entry[0] not in matched_indices:
+          return entry
+      # A runner path may carry a wrapper prefix the bound name lacks; match on
+      # a whole-segment suffix so `a.b.w` still finds `b.w`, never `ab.w`.
+      for candidate, entries in key_to_entries.items():
+        if not key.endswith("." + candidate):
+          continue
+        for entry in entries:
+          if entry[0] not in matched_indices:
+            return entry
+      return None
+
+    for i, (path, leaf) in enumerate(runner_leaves_with_path):
+      p_str = jax.tree_util.keystr(path)
+      entry = _claim(_param_key(p_str))
+
+      if entry is not None:
+        idx, orig_name, arr = entry
+        leaf_arr = getattr(leaf, "value", leaf)
+        if hasattr(leaf_arr, "shape") and leaf_arr.shape != arr.shape:
+          raise ValueError(
+              f"Shape mismatch for parameter '{orig_name}' (runner path"
+              f" '{p_str}'): runner shape {leaf_arr.shape} vs synchronizer"
+              f" shape {arr.shape}"
+          )
+        new_leaves[i] = arr
+        matched_indices.add(idx)
+
+    if len(matched_indices) != len(self.arrays):
+      unmatched = [
+          self.names[j]
+          for j in range(len(self.arrays))
+          if j not in matched_indices
+      ]
+      raise RuntimeError(
+          f"{self.job_name}: Not all synchronizer arrays were matched in"
+          f" runner.state! Matched {len(matched_indices)} of {len(self.arrays)}"
+          f" arrays. Unmatched {len(unmatched)} parameters, e.g.:"
+          f" {unmatched[:10]}"
+      )
+
+    runner.state_leaves = tuple(new_leaves)
+    runner.state = jax.tree_util.tree_unflatten(
+        jax.tree_util.tree_structure(runner.state), new_leaves
+    )
+    logging.info(
+        "%s apply_to_runner: successfully applied %d arrays to runner state and"
+        " state_leaves (total runner leaves: %d).",
+        self.job_name,
+        len(matched_indices),
+        len(new_leaves),
+    )
+
+  def work_unit_metadata_all(self) -> List[weight_sync.WorkUnitMetadata]:
+    """Returns work unit metadata for registration.
+
+    In proxy/FFI mode, control_addr contains all comma-separated unique listener
+    addresses. The coordinator registers a single work unit and the Raiden
+    controller broadcasts to all listeners in parallel.
+    """
+    return [self.work_unit_metadata()]
+
   def metrics(self) -> dict:
     return self._sync.get_metrics() if self._sync else {}
 
@@ -635,51 +850,65 @@ class RaidenSynchronizer:
         for name, arr in list(zip(self.names, self.arrays))[:sample]
     }
     head["__grand_total__"] = float(sum(total(a) for a in self.arrays))
-    # Metadata for cross-checking the weight-sync result.
+    # Registration pairs tensors by position, so the totals only compare when
+    # both sides bound the same set. Check these before trusting a mismatch.
     head["__tensor_count__"] = len(self.arrays)
     head["__element_count__"] = int(sum(a.size for a in self.arrays))
     return head
 
   def work_unit_metadata(self) -> weight_sync.WorkUnitMetadata:
-    target_devices = None
-    if self._is_proxy:
-      for arr in self.arrays:
-        m = getattr(getattr(arr, "sharding", None), "mesh", None)
-        if m is not None:
-          target_devices = list(m.devices.flatten())
-          break
-    elif self.arrays:
-      target_devices = [s.device for s in self.arrays[0].addressable_shards]
-
-    variables = tuple(
-        _tensor_metadata(name, arr, idx, target_devices)
-        for idx, (name, arr) in enumerate(zip(self.names, self.arrays))
-    )
-    mesh_axes: tuple = ()
-    mesh_shape = None
+    mesh = None
     for arr in self.arrays:
       mesh = getattr(getattr(arr, "sharding", None), "mesh", None)
       if mesh is not None:
-        mesh_axes = tuple(mesh.axis_names)
-        mesh_shape = tuple(mesh.shape[a] for a in mesh.axis_names)
         break
-    if mesh_shape is None:
-      mesh_axes = ("fsdp",)
-      mesh_shape = (1,)
+    if mesh is None:
+      mesh_axes, mesh_shape = ("fsdp",), (1,)
+    else:
+      # Advertise the same mesh the shards were built on.
+      mesh_axes = tuple(mesh.axis_names)
+      mesh_shape = tuple(int(mesh.shape[a]) for a in mesh.axis_names)
+    # Publish the canonical key, not the raw keystr: the controller pairs
+    # variables by EXACT name, and the two sides root the same tree
+    # differently (trainer `['base'][...]` vs rollout `['model'][...]`, plus
+    # the nnx `.value` leaf). `_param_key` already normalises both away, so
+    # canonicalising here is what makes the manifests line up.
+    variables = tuple(
+        _tensor_metadata(_param_key(name), arr, idx)
+        for idx, (name, arr) in enumerate(zip(self.names, self.arrays))
+    )
     if self._is_proxy:
       shards = tuple(self._ips)
       control_addr = (
           ",".join(self._unique_listeners) if self._unique_listeners else ""
       )
     else:
-      data_addr = f"{self.ip}:{self._sync.local_port}" if self._sync else ""
+      num_shards = self._sync.num_shards if self._sync else 1
+      shards_list = [""] * num_shards
+      if self._sync and hasattr(self._sync, "get_local_endpoints"):
+        try:
+          for ep in self._sync.get_local_endpoints():
+            ep_addr = ep.get("endpoint", "")
+            if ep_addr.startswith(":"):
+              ep_addr = f"{self.ip}{ep_addr}"
+            elif ":" in ep_addr:
+              parts = ep_addr.split(":")
+              if parts[0] in ("0.0.0.0", "127.0.0.1", ""):
+                ep_addr = f"{self.ip}:{parts[1]}"
+            for s in ep.get("shards", []):
+              if 0 <= s < num_shards:
+                shards_list[s] = ep_addr
+        except Exception:
+          pass
+      if not all(shards_list):
+        data_addr = f"{self.ip}:{self._sync.local_port}" if self._sync else ""
+        shards_list = [s or data_addr for s in shards_list] if data_addr else []
+      shards = tuple(shards_list)
       control_addr = (
           f"{self.ip}:{self._sync.listener_port}"
           if self._sync and self._sync.listener_port
           else ""
       )
-      num_shards = self._sync.num_shards if self._sync else 1
-      shards = (data_addr,) * num_shards if data_addr else ()
     # Index 0 keeps the default replica id "": transfer callers construct
     # WorkUnitId(job_name=...) without a replica, and registration lookups
     # must match it for single-replica units.
@@ -687,31 +916,6 @@ class RaidenSynchronizer:
         job_name=self.job_name,
         job_replica_id=str(self.worker_index) if self.worker_index else "",
     )
-    host_subgrid = self._host_subgrid
-    if host_subgrid is None:
-      host_subgrid_env = os.environ.get("RAIDEN_HOST_SUBGRID")
-      if host_subgrid_env:
-        try:
-          host_subgrid = tuple(
-              int(x.strip()) for x in host_subgrid_env.split(",")
-          )
-        except ValueError:
-          pass
-    if host_subgrid is None:
-      for arr in self.arrays:
-        m = getattr(getattr(arr, "sharding", None), "mesh", None)
-        if m is not None:
-          try:
-            if (
-                hasattr(m, "local_mesh")
-                and m.local_mesh is not None
-                and hasattr(m.local_mesh, "devices")
-            ):
-              host_subgrid = tuple(m.local_mesh.devices.shape)
-              break
-          except (AttributeError, ValueError, TypeError):
-            pass
-
     return weight_sync.WorkUnitMetadata(
         unit=unit,
         shards=shards,
@@ -719,13 +923,40 @@ class RaidenSynchronizer:
         mesh_shape=mesh_shape,
         variables=variables,
         mesh_axes=mesh_axes or None,
-        host_subgrid=host_subgrid,
+        transport_mode="ffi" if self._is_proxy else "tcp",
+        use_ffi=self._is_proxy,
+        host_subgrid=self._host_subgrid,
     )
 
 
-try:
-  from tpu_sync.frameworks.jax import utils as _raiden_jax_utils
-  if hasattr(_raiden_jax_utils, "get_shard_sorting_permutation"):
-    _raiden_jax_utils.get_shard_sorting_permutation = lambda arr: []
-except (ImportError, AttributeError):
-  pass
+def patch_raiden_worker_sync() -> None:
+  """Monkey-patches tpu_inference.rl.raiden_worker_sync.RaidenWorkerSync to delegate apply_to_runner."""
+  if os.environ.get("JAX_PLATFORMS") == "cpu":
+    return
+  # Resolved through importlib, like the other optional deps in this module, so
+  # static dependency analysis does not try to follow tpu-inference -- it is not
+  # a declared dependency and is absent in many environments.
+  rws = _lazy_import_module("tpu_inference.rl.raiden_worker_sync")
+  if rws is None:
+    logging.debug("tpu_inference not available to patch")
+    return
+  try:
+    if getattr(rws.RaidenWorkerSync, "_patched_by_tunix", False):
+      return
+    orig_apply = getattr(rws.RaidenWorkerSync, "apply_to_runner", None)
+
+    def _patched_apply_to_runner(self, runner: Any) -> None:
+      if self._sync is not None and hasattr(self._sync, "apply_to_runner"):
+        self._sync.apply_to_runner(runner)
+        return
+      if orig_apply is not None:
+        orig_apply(self, runner)
+
+    rws.RaidenWorkerSync.apply_to_runner = _patched_apply_to_runner
+    rws.RaidenWorkerSync._patched_by_tunix = True
+    logging.info(
+        "Successfully patched RaidenWorkerSync.apply_to_runner with Tunix"
+        " delegation."
+    )
+  except AttributeError as e:
+    logging.debug("tpu_inference not available to patch: %s", e)

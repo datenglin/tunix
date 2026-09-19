@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import asyncio
-import importlib
 import logging
 import os
 from typing import Any, List, Mapping, Sequence
@@ -32,18 +31,16 @@ logger = logging.getLogger(__name__)
 
 
 def _get_rl_vllm_sampler_cls():
-  """Lazy import of tpu_inference.rl.RLVllmSampler.
+  """Lazy import of tunix.experimental.rollout.vllm_sampler_v2.RLVllmSampler.
 
-  Resolved through importlib so static analyzers do not try to follow the
-  tpu-inference dependency, which is not available in every environment.
+  Deferred because `vllm_sampler_v2` imports vLLM at module scope, while
+  `rollout/__init__.py` imports this module eagerly and vLLM is not a
+  dependency of the base `google-tunix` install. Importing it at module scope
+  would break `import tunix.experimental.rollout` wherever vLLM is absent.
   """
-  try:
-    return getattr(importlib.import_module("tpu_inference.rl"), "RLVllmSampler")
-  except (ImportError, AttributeError) as e:
-    raise ImportError(
-        "tpu_inference.rl.RLVllmSampler is not available. Please ensure"
-        " tpu-inference is installed."
-    ) from e
+  from tunix.experimental.rollout import vllm_sampler_v2  # pylint: disable=g-import-not-at-top
+
+  return vllm_sampler_v2.RLVllmSampler
 
 
 # Hooks RLVllmSampler must expose for Raiden weight sync; verified once at
@@ -55,6 +52,52 @@ _REQUIRED_RAIDEN_METHODS = (
     "raiden_h2d",
     "post_weight_sync",
 )
+
+
+def _round_uuid(sync_request: Any) -> int:
+  """Extracts this weight-sync round's transfer generation.
+
+  The coordinator stamps each round with a monotonic `uuid` in
+  `extra_config` and passes that same value to Raiden as the transfer
+  `generation`, so it is what the destination must wait on to be sure it
+  observed *this* round's transfer rather than a neighbouring one.
+
+  Args:
+    sync_request: The `WeightSyncRequest` for this round, or any object
+      carrying an `extra_config` mapping.
+
+  Returns:
+    The round's transfer generation, always positive.
+
+  Raises:
+    ValueError: If the uuid is absent, non-positive, or malformed. This
+      mirrors the send side, which rejects a non-positive generation in
+      `raiden_handler.transfer`. Degrading to an untargeted wait instead
+      would silently reintroduce the cross-round race that waiting on a
+      specific generation exists to prevent, so it is refused loudly.
+  """
+  extra = getattr(sync_request, "extra_config", None) or {}
+  raw = extra.get("uuid")
+  if raw is None:
+    raise ValueError(
+        "weight sync round is missing a usable transfer uuid:"
+        " extra_config['uuid'] is unset. The coordinator always stamps one;"
+        " a hand-built WeightSyncRequest must supply one too."
+    )
+  try:
+    uuid = int(raw)
+  except (TypeError, ValueError) as e:
+    raise ValueError(
+        f"weight sync round is missing a usable transfer uuid: got {raw!r},"
+        " which is not an integer."
+    ) from e
+  if uuid <= 0:
+    raise ValueError(
+        f"weight sync round carries a non-positive transfer uuid ({uuid});"
+        " Raiden generations start at 1, and 0 is WorkerRoundTracker's"
+        " 'no round' sentinel."
+    )
+  return uuid
 
 
 def _format_sampling_response(r: Any) -> base_sampler_lib.SamplingResponse:
@@ -84,6 +127,64 @@ def _format_sampling_response(r: Any) -> base_sampler_lib.SamplingResponse:
   )
 
 
+def _canonicalize_variable_names(entry: Any) -> Any:
+  """Rewrites destination variable names into the canonical dotted key format.
+
+  The weight-sync controller pairs source and destination variables by exact
+  name.
+  `tpu_inference.rl.raiden_worker_sync` formats destination variable names with
+  brackets and quotes (e.g. ['base']['decoder']...), whereas
+  `raiden_synchronizer`
+  expects canonical dotted keys (e.g. decoder...). This function canonicalizes
+  names using `raiden_synchronizer._param_key`.
+  """
+  from tunix.experimental.weight_sync import (  # pylint: disable=g-import-not-at-top
+      raiden_synchronizer,
+  )
+
+  if not isinstance(entry, Mapping):
+    return entry
+  variables = entry.get("variables")
+  if not variables:
+    return entry
+
+  canonical = []
+  renamed = 0
+  seen: dict[str, str] = {}
+  for v in variables:
+    if isinstance(v, Mapping) and v.get("name"):
+      original = v["name"]
+      key = raiden_synchronizer._param_key(original)  # pylint: disable=protected-access
+      if not key:
+        raise ValueError(
+            "Raiden destination variable name canonicalised to an empty key: "
+            f"{original!r}. Refusing to publish a manifest that cannot pair."
+        )
+      if seen.setdefault(key, original) != original:
+        raise ValueError(
+            f"Raiden destination variables {seen[key]!r} and {original!r} both "
+            f"canonicalise to {key!r}. Refusing to publish an ambiguous "
+            "manifest."
+        )
+      if key != original:
+        renamed += 1
+      v = {**v, "name": key}
+    canonical.append(v)
+
+  if renamed:
+    logger.info(
+        "Canonicalised %d/%d destination variable names for manifest pairing"
+        " (e.g. %r -> %r).",
+        renamed,
+        len(canonical),
+        variables[0].get("name"),
+        canonical[0].get("name"),
+    )
+  out = dict(entry)
+  out["variables"] = canonical
+  return out
+
+
 class VllmSamplerAdapter(Sampler, weight_sync.WeightSyncDestination):
   """Sampler adapter wrapping tpu-inference RLVllmSampler with full Raiden weight sync."""
 
@@ -103,7 +204,18 @@ class VllmSamplerAdapter(Sampler, weight_sync.WeightSyncDestination):
     self.model_name = model_name or (engine_args.model if engine_args else "")
     self.sampler = sampler_instance
     self.worker_index = worker_index
-    self._parallelism = parallelism
+    # Raiden treats units sharing a job_name as hosts of ONE job and splits the
+    # weights across them (`num_dst_physical_hosts` in raiden_controller), so
+    # independent rollout replicas each need their own job_name to be sent a
+    # full copy. server_id already has that granularity; worker_index stays the
+    # host index *within* one replica.
+    self.raiden_job_name = f"replica_{self.server_id}"
+    self._parallelism = int(
+        os.getenv(
+            "RAIDEN_PARALLELISM",
+            str(parallelism if parallelism is not None else 16),
+        )
+    )
 
     # Defaults to RAIDEN when unspecified: RLVllmSampler drives weight sync
     # through its own native Raiden hooks, so callers that construct the
@@ -273,7 +385,9 @@ class VllmSamplerAdapter(Sampler, weight_sync.WeightSyncDestination):
       return None
     await self._ensure_started()
     return await self._require_sampler().bind_raiden_sync(
-        worker_index=self.worker_index, parallelism=self._parallelism
+        worker_index=self.worker_index,
+        parallelism=self._parallelism,
+        job_name=self.raiden_job_name,
     )
 
   async def get_weight_sync_metadata(
@@ -290,7 +404,10 @@ class VllmSamplerAdapter(Sampler, weight_sync.WeightSyncDestination):
       )
     await self._ensure_started()
     meta = await self._require_sampler().get_raiden_metadata()
-    return [weight_sync.WorkUnitMetadata.from_dict(m) for m in meta or []]
+    return [
+        weight_sync.WorkUnitMetadata.from_dict(_canonicalize_variable_names(m))
+        for m in meta or []
+    ]
 
   async def pre_weight_sync(
       self, sync_request: Any = None, **kwargs: Any
@@ -328,7 +445,7 @@ class VllmSamplerAdapter(Sampler, weight_sync.WeightSyncDestination):
         return True
 
       logger.info("Executing weight_sync barrier on Raiden synchronizers...")
-      checksums = await sampler.raiden_h2d()
+      checksums = await sampler.raiden_h2d(uuid=_round_uuid(sync_request))
       if checksums:
         logger.info("Destination weights checksums: %s", checksums)
 
@@ -336,6 +453,16 @@ class VllmSamplerAdapter(Sampler, weight_sync.WeightSyncDestination):
         result = sampler.refresh_model_state_leaves()
         if asyncio.iscoroutine(result):
           await result
+      else:
+        # Never silently skip this: the sampler's runner dispatches through a
+        # `state_leaves` view derived from `state` at load time, so without the
+        # refresh it keeps serving pre-sync weights and the only symptom is
+        # garbage completions.
+        logger.warning(
+            "sampler %s has no refresh_model_state_leaves(); the rollout's"
+            " state_leaves are not re-pointed after h2d.",
+            type(sampler).__name__,
+        )
 
       self._tracker.complete(sync_request, "h2d_done")
       return True

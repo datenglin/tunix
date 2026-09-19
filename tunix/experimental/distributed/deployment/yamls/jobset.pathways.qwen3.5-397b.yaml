@@ -16,8 +16,8 @@ apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
   name: ${JOBSET_NAME}
-  namespace: default
-spec:
+  namespace: ${NAMESPACE}
+${QUEUE_LABEL}spec:
   coordinator:
     replicatedJob: proc
   failurePolicy:
@@ -264,6 +264,10 @@ spec:
                 value: "0"
               - name: XCLOUD_ENVIRONMENT
                 value: GCP
+              - name: RAIDEN_TRANSPORT_COALESCE_WINDOW_BYTES
+                value: "67108864"
+              - name: RAIDEN_WEIGHT_SYNC_PIPELINE_GROUP_SIZE
+                value: "16"
               - name: MEGASCALE_GRPC_ENABLE_XOR_TRACER
                 value: "false"
               - name: MEGASCALE_NUM_SLICES

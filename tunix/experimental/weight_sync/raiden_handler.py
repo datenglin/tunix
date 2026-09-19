@@ -35,14 +35,20 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import math
 import threading
-from typing import Any, Mapping, Optional, Sequence
-
-from tpu_sync.rpc import controller_service_pb2
-from tpu_sync.rpc import raiden_controller
-from tpu_sync.rpc import raiden_service_pb2
+from typing import Any, Optional, Sequence
 
 from tunix.experimental.weight_sync import weight_sync
+
+try:
+  from google3.third_party.tpu_raiden.tpu_sync.rpc import controller_service_pb2
+  from google3.third_party.tpu_raiden.tpu_sync.rpc import raiden_controller
+  from google3.third_party.tpu_raiden.tpu_sync.rpc import raiden_service_pb2
+except ImportError:
+  from tpu_sync.rpc import controller_service_pb2  # pytype: disable=import-error
+  from tpu_sync.rpc import raiden_controller  # pytype: disable=import-error
+  from tpu_sync.rpc import raiden_service_pb2  # pytype: disable=import-error
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,7 +58,7 @@ class RaidenTransferOptions:
   parallelism: Optional[int] = None
   expected_block_count: Optional[int] = None
   skip_d2h: bool = False
-  skip_tiling: Optional[Mapping[int, bool]] = None
+  skip_tiling: Optional[dict[int, bool]] = None
   group_size: int = 1
 
   def __post_init__(self) -> None:
@@ -76,32 +82,32 @@ class RaidenTransferOptions:
 
 
 def make_host_staged_transfer_options(
-      parallelism: int = 16,
-      group_size: int = 128,
-      max_layers: int = 512,
-  ) -> RaidenTransferOptions:
-    """Transfer options for host-staged (CPU) weight sources.
+    parallelism: int = 16,
+    group_size: int = 128,
+    max_layers: int = 2048,
+) -> RaidenTransferOptions:
+  """Transfer options for host-staged (CPU) weight sources.
 
-    The controller derives skip_tiling from slice geometry when none is
-    given, marking aligned tensors as pre-tiled — but a host-staged source
-    can only stage logical bytes, so the derived plan installs permuted
-    data. An explicit all-False map keeps every tensor on the logical path.
+  The controller derives skip_tiling from slice geometry when none is
+  given, marking aligned tensors as pre-tiled — but a host-staged source
+  can only stage logical bytes, so the derived plan installs permuted
+  data. An explicit all-False map keeps every tensor on the logical path.
 
-    Args:
-     parallelism: Number of concurrent transfer streams.
-     group_size: Number of tensors the controller moves per group.
-     max_layers: Upper bound for the skip_tiling map. The receiver drops
-      indices past its own layer count, so a generous value is safe.
+  Args:
+   parallelism: Number of concurrent transfer streams.
+   group_size: Number of tensors the controller moves per group.
+   max_layers: Upper bound for the skip_tiling map. The receiver drops indices
+     past its own layer count, so a generous value is safe.
 
-    Returns:
-     Options matching the validated e2e run and the pathways benchmark
-     client.
-    """
-    return RaidenTransferOptions(
-        parallelism=parallelism,
-        group_size=group_size,
-        skip_tiling={i: False for i in range(max_layers)},
-    )
+  Returns:
+   Options matching the validated e2e run and the pathways benchmark
+   client.
+  """
+  return RaidenTransferOptions(
+      parallelism=parallelism,
+      group_size=group_size,
+      skip_tiling={i: False for i in range(max_layers)},
+  )
 
 
 class _RaidenTransport:
@@ -196,7 +202,7 @@ class _RaidenTransport:
 
   @staticmethod
   def _to_variable_proto(tensor: weight_sync.TensorMetadata) -> Any:
-    proto = raiden_service_pb2.VariableMetadataProto(
+    var_proto = raiden_service_pb2.VariableMetadataProto(
         name=tensor.name,
         shape=list(tensor.shape),
         mesh_shape=list(tensor.mesh_shape),
@@ -205,15 +211,9 @@ class _RaidenTransport:
         layer_idx=tensor.layer_idx,
         sharding_spec=list(tensor.sharding_spec),
     )
-    if tensor.global_shard_indices:
-      if hasattr(proto, "DESCRIPTOR") and "global_shard_indices" in proto.DESCRIPTOR.fields_by_name:
-        proto.global_shard_indices.extend(tensor.global_shard_indices)
-      else:
-        logging.warning(
-            "Installed tpu_sync wheel does not support global_shard_indices in"
-            " VariableMetadataProto. Falling back to legacy mesh geometry."
-        )
-    return proto
+    if hasattr(tensor, "global_shard_indices") and tensor.global_shard_indices:
+      var_proto.global_shard_indices.extend(tensor.global_shard_indices)
+    return var_proto
 
   def register_work_unit(self, metadata: weight_sync.WorkUnitMetadata) -> None:
     if not metadata.shards:
@@ -226,7 +226,7 @@ class _RaidenTransport:
     self._controller.register_work_unit(
         unit=self._to_raiden_id(metadata.unit),
         shards=list(metadata.shards),
-        control_plane_rpc_address=metadata.control_plane_rpc_address,
+        control_plane_rpc_address=metadata.control_plane_rpc_address or None,
         mesh_shape=metadata.mesh_shape,
         layout=metadata.layout,
         global_shape=metadata.global_shape,
@@ -285,16 +285,23 @@ class _RaidenTransport:
                 f" of {tensor.name!r} must have logical mesh size 1, got"
                 f" {logical_size}"
             )
-        elif axis not in physical_axes:
+          continue
+        # A dimension may be sharded over the product of several axes, which
+        # the wire form spells comma-joined; the controller splits it the same
+        # way to fold the sub-axis coordinates into one tensor coordinate.
+        sub_axes = axis.split(",")
+        unknown = [a for a in sub_axes if a not in physical_axes]
+        if unknown:
           raise ValueError(
               f"work unit {metadata.unit}: variable {tensor.name!r} names"
               f" unknown mesh axis {axis!r}"
           )
-        elif logical_size != physical_axes[axis]:
+        physical_size = math.prod(physical_axes[a] for a in sub_axes)
+        if logical_size != physical_size:
           raise ValueError(
               f"work unit {metadata.unit}: variable {tensor.name!r} maps axis"
               f" {axis!r} to logical size {logical_size}, but the physical"
-              f" mesh has size {physical_axes[axis]}"
+              f" mesh has size {physical_size}"
           )
 
   def transfer(
@@ -323,44 +330,20 @@ class _RaidenTransport:
     options = self._transfer_options
     if expected_block_count is None:
       expected_block_count = options.expected_block_count
-    if expected_block_count is not None and expected_block_count < 0:
-      raise ValueError(
-          "expected_block_count must be None (auto) or >= 0, got"
-          f" {expected_block_count}"
-      )
     resolved_uuid = self._transfer_uuid if generation is None else generation
     if resolved_uuid <= 0:
       raise ValueError(f"uuid must be positive, got {resolved_uuid}")
-    resolved_parallelism = (
-        options.parallelism if parallelism is None else parallelism
+    resolved_options = RaidenTransferOptions(
+        parallelism=options.parallelism if parallelism is None else parallelism,
+        expected_block_count=expected_block_count,
+        skip_d2h=options.skip_d2h if skip_d2h is None else skip_d2h,
+        skip_tiling=(
+            dict(options.skip_tiling)
+            if skip_tiling is None and options.skip_tiling is not None
+            else skip_tiling
+        ),
+        group_size=options.group_size if group_size is None else group_size,
     )
-    resolved_skip_d2h = options.skip_d2h if skip_d2h is None else skip_d2h
-    resolved_skip_tiling = (
-        dict(options.skip_tiling)
-        if skip_tiling is None and options.skip_tiling is not None
-        else skip_tiling
-    )
-    resolved_group_size = (
-        options.group_size if group_size is None else group_size
-    )
-    if resolved_parallelism is not None and resolved_parallelism <= 0:
-      raise ValueError(
-          f"parallelism must be positive when specified, got"
-          f" {resolved_parallelism}"
-      )
-    if resolved_group_size <= 0:
-      raise ValueError(
-          f"group_size must be positive, got {resolved_group_size}"
-      )
-    if resolved_skip_tiling is not None and any(
-        layer < 0 for layer in resolved_skip_tiling
-    ):
-      raise ValueError("skip_tiling layer indices must be non-negative")
-    if resolved_skip_d2h and resolved_skip_tiling is None:
-      raise ValueError(
-          "skip_d2h=True requires an explicit skip_tiling map describing"
-          " the source staging format"
-      )
 
     try:
       asyncio.get_running_loop()
@@ -386,7 +369,7 @@ class _RaidenTransport:
             " Omit it for single-controller deployments."
         )
 
-    resolved_block_count = expected_block_count or 0
+    resolved_block_count = resolved_options.expected_block_count or 0
     if kwargs["use_block_chunks"] and resolved_block_count == 0:
       logging.info(
           "transfer %s: expected_block_count auto; deferring to the"
@@ -418,10 +401,10 @@ class _RaidenTransport:
               dst_units=[self._to_raiden_id(unit) for unit in dst_units],
               req_id=req_id,
               expected_block_count=resolved_block_count,
-              parallelism=resolved_parallelism,
-              skip_d2h=resolved_skip_d2h,
-              skip_tiling=resolved_skip_tiling,
-              group_size=resolved_group_size,
+              parallelism=resolved_options.parallelism,
+              skip_d2h=resolved_options.skip_d2h,
+              skip_tiling=resolved_options.skip_tiling,
+              group_size=resolved_options.group_size,
               uuid=resolved_uuid,
               **kwargs,
           )
