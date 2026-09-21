@@ -542,7 +542,7 @@ class PhaseTimeouts:
   source_prepare: float = 900.0
   pre: float = 180.0
   transfer: float = 1800.0
-  h2d: float = 1800.0
+  h2d: float = float(os.getenv("WEIGHT_SYNC_TIMEOUT_H2D", "1800.0"))
   post: float = 300.0
   abort: float = 180.0
   status: float = 30.0
